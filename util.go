@@ -18,8 +18,59 @@ import (
 	"bytes"
 	"encoding/hex"
 	"io"
+	"math/rand"
 	"os"
+	"time"
 )
+
+// backoff is a simple way to calculate the backoff to use eg. when doing
+// retries.
+//
+// The backoff time will be a random value between [0, n), where n is
+// min(Max, (2^count * Step))) and count is the number of attempts. Every call
+// to Backoff() or Wait() counts as an attempt.
+type backoff struct {
+	// Max is the maximum time to return from Backoff.
+	Max time.Duration
+
+	// Step is the factor used when calculating the backoff duration.
+	Step time.Duration
+
+	count uint
+}
+
+func (bt *backoff) defaultDuration(a, b time.Duration) time.Duration {
+	if a == 0 {
+		return b
+	}
+	return a
+}
+
+// Backoff returns the backoff calculated for this attempt.
+func (bt *backoff) Backoff() time.Duration {
+	// Use some sane defaults unless specified
+	max := bt.defaultDuration(bt.Max, 60*time.Second)
+	step := bt.defaultDuration(bt.Step, 42*time.Millisecond)
+
+	if bt.count < 63 {
+		bt.count++
+	}
+
+	// TODO verify that this calculation actually makes sense
+	random := time.Duration(rand.Int() % ((1 << bt.count) - 1))
+	backoff := step * random
+	if max > 0 && backoff > max {
+		backoff = max
+	}
+
+	return backoff
+}
+
+// Wait is a shorthand for time.Sleep() on the returned duration from
+// Backoff().
+func (bt *backoff) Wait() {
+	time.Sleep(bt.Backoff())
+}
 
 // hexDumper is used to buffer data until Flush is called, then dump all
 // written data to the Writer stream in a format that matches `hexdump -C`.
