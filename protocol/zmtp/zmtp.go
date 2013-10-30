@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"io"
 	"syscall"
+
+	"github.com/op/zenio/protocol"
 )
 
 var (
@@ -45,26 +47,50 @@ const (
 
 const maxInt = int(^uint(0) >> 1)
 
-// ReadWriter wraps the Reader and Writer into one, making a composition which
-// implements io.ReadWriter.
-type ReadWriter struct {
-	Reader
-	Writer
+type frame struct {
+	lr *io.LimitedReader
+}
+
+func (f *frame) Read(p []byte) (int, error) {
+	return f.lr.Read(p)
+}
+
+func (f *frame) Len() int {
+	return int(f.lr.N)
+}
+
+type frameReader struct {
+	r    *Reader
+	last *frame
+	more bool
+}
+
+func (fr *frameReader) More() bool {
+	return fr.more
+}
+
+func (fr *frameReader) Next() (frame protocol.Frame, err error) {
+	if fr.last != nil {
+		if fr.last.Len() > 0 {
+			panic("previous frame not fully consumed")
+		} else if !fr.more {
+			// TODO return io.EOF?
+			panic("no more frames available")
+		}
+	}
+	fr.last, fr.more, err = fr.r.readFrame()
+	return fr.last, err
 }
 
 // A Reader reads ZMTP data from a reader. First Read will also read header
 // data.
 type Reader struct {
 	rd  io.Reader
-	buf [8]byte
+	buf [10]byte
 
 	setupDone bool
-	peeked    bool
-	length    int
-	more      bool
+	broken    bool
 
-	// Identity is used as an addressing mechanism in ZMTP. It will be populated
-	// once Peek or Read has been called.
 	Identity []byte
 }
 
@@ -73,15 +99,21 @@ func NewReader(rd io.Reader) *Reader {
 	return &Reader{rd: rd}
 }
 
+// TODO rename to Handshake or similar, and make symmetric
 func (r *Reader) Init() error {
-	return r.setup()
+	err := r.setup()
+	if err != nil {
+		r.broken = true
+	}
+	return err
 }
 
 func (r *Reader) setup() error {
 	if r.setupDone {
 		return nil
+	} else if r.broken {
+		return errors.New("zenio: can't read from broken stream")
 	}
-
 	if _, err := io.ReadFull(r.rd, r.buf[0:2]); err != nil {
 		return err
 	}
@@ -101,101 +133,54 @@ func (r *Reader) setup() error {
 	return nil
 }
 
-// Len is populated once Peek has been called and indicates the number of bytes
-// waiting to be read in the next call to Read.
-func (r *Reader) Len() int {
-	return r.length
-}
-
-// More is populated once Peek has been called and indicates that there is more
-// frames to read for the same message.
-//
-// One ZMTP message might consist of multiple frames.
-func (r *Reader) More() bool {
-	return r.more
-}
-
-// Peek reads the length and flags of the payload which is to be read in
-// the next call to Read.
-func (r *Reader) Peek() error {
-	if err := r.setup(); err != nil {
-		return err
-	} else if r.peeked == true {
-		return nil
+func (r *Reader) readFrame() (f *frame, more bool, err error) {
+	if r.broken {
+		return nil, false, errors.New("zenio: can't read from broken stream")
 	}
 
-	if _, err := io.ReadFull(r.rd, r.buf[0:1]); err != nil {
-		return err
+	// We know that we need to read at least 2 bytes. The simple case is that we
+	// read 1 byte for the length and 1 byte for flags. If the length is 0xff, we
+	// need to read 8 additional bytes for the length.
+	if _, err := io.ReadFull(r.rd, r.buf[0:2]); err != nil {
+		return nil, false, err
 	}
 	var length uint64
+	var flags uint8
 	if r.buf[0] == 0xff {
-		if _, err := io.ReadFull(r.rd, r.buf[0:8]); err != nil {
-			return err
+		if _, err := io.ReadFull(r.rd, r.buf[2:10]); err != nil {
+			return nil, false, err
 		}
-		length = binary.BigEndian.Uint64(r.buf[0:8])
+		length = binary.BigEndian.Uint64(r.buf[1:9])
+		flags = r.buf[9]
 	} else {
 		length = uint64(r.buf[0])
+		flags = r.buf[1]
 	}
 
+	// Length is always > 0 since the flag is also included in the size.
 	if length == 0 {
-		return errors.New("zenio: invalid frame header")
+		return nil, false, errors.New("zenio: invalid frame header")
 	} else if length-1 > uint64(maxInt) {
-		return syscall.EFBIG
+		return nil, false, syscall.EFBIG
 	}
-	r.length = int(length - 1)
+	lr := &io.LimitedReader{r.rd, int64(length - 1)}
+	frame := &frame{lr}
 
 	// Handle flags in the frame
-	if _, err := io.ReadFull(r.rd, r.buf[0:1]); err != nil {
-		return err
-	}
-	var flags = r.buf[0]
 	if flags > 1 {
-		return errors.New(fmt.Sprintf("zenio: invalid flag: 0x%02x", flags))
+		return frame, false, fmt.Errorf("zenio: invalid flag: 0x%02x", flags)
 	}
-	r.more = (flags & frameFlagMore) == frameFlagMore
-	r.peeked = true
-
-	return nil
+	more = (flags & frameFlagMore) == frameFlagMore
+	return frame, more, nil
 }
 
 // Read reads the payload data into p.
-func (r *Reader) Read(p []byte) (int, error) {
-	if err := r.Peek(); err != nil {
-		return 0, err
+func (r *Reader) Read() (protocol.Message, error) {
+	if err := r.setup(); err != nil {
+		r.broken = true
+		return nil, err
 	}
-	r.peeked = false
-
-	// TODO share code with sp for the whole next block
-	l := r.length
-	if cap(p) < l {
-		l = cap(p)
-	}
-	n, err := r.rd.Read(p[:l])
-	if err != nil {
-		return n, err
-	}
-	return r.flush(n, p)
-}
-
-// TODO copied from sp.go.
-func (r *Reader) flush(read int, p []byte) (int, error) {
-	unread := r.length - read
-	if unread > 0 {
-		var flush [128]byte
-		for unread > 0 {
-			s := unread
-			if s < len(flush) {
-				s = len(flush)
-			}
-			fn, ferr := r.rd.Read(flush[:])
-			if ferr != nil {
-				break
-			}
-			unread -= fn
-		}
-		return read, syscall.EFBIG
-	}
-	return read, nil
+	return &frameReader{r: r, more: true}, nil
 }
 
 // Writer writes the data according to ZMTP. First write will initiate the
@@ -205,7 +190,7 @@ type Writer struct {
 	buf [10]byte
 
 	setupDone bool
-	more      bool
+	broken    bool
 
 	// Identity is used as an addressing mechanism in ZMTP. If not specified, the
 	// anonymous identity will be used. The maximum length is 254 bytes and should
@@ -227,6 +212,8 @@ func (w *Writer) Init() error {
 func (w *Writer) setup() error {
 	if w.setupDone {
 		return nil
+	} else if w.broken {
+		return errors.New("zenio: can't write to broken stream")
 	}
 
 	// The identity can be at max 254 bytes (1 byte for flags)
@@ -259,25 +246,33 @@ func (w *Writer) setup() error {
 	return nil
 }
 
-// SetMore sets the flag which indicates that there are more frames to deliver
-// after the next call to Write. A ZMTP message might consist of multiple
-// frames.
-func (w *Writer) SetMore(more bool) {
-	w.more = more
-}
-
-// Write writes the payload. Use the More flag to control the behaviour of this
-// method.
-func (w *Writer) Write(p []byte) (int, error) {
-	if err := w.setup(); err != nil {
-		return 0, err
+// Write writes the payload.
+func (w *Writer) Write(src protocol.Message) error {
+	var err error
+	if err = w.setup(); err != nil {
+		w.broken = true
+		return err
 	}
 
+	for {
+		frame, err := src.Next()
+		if err = w.writeFrame(frame, src.More()); err != nil {
+			w.broken = true
+			return err
+		}
+		if !src.More() {
+			break
+		}
+	}
+	return nil
+}
+
+func (w *Writer) writeFrame(frame protocol.Frame, more bool) error {
 	// Setup the length of the frame. If the length is < 0xff, only one
 	// byte is needed. For bigger frames, the first byte is 0xff and the
 	// next 8 bytes consists of the length.
 	var size int
-	var length = uint64(len(p)) + 1
+	var length = uint64(frame.Len()) + 1
 	if length < 0xff {
 		w.buf[0] = byte(length)
 		size = 1
@@ -289,17 +284,21 @@ func (w *Writer) Write(p []byte) (int, error) {
 
 	// Add flags for the frame.
 	var flags = uint8(0)
-	if w.more {
+	if more {
 		flags |= frameFlagMore
 	}
 	w.buf[size] = flags
 	size++
 
 	if n, err := w.wr.Write(w.buf[0:size]); err != nil {
-		return 0, err
+		return err
 	} else if n != size {
-		return 0, errors.New("zenio: failed to write frame header")
+		return errors.New("zenio: failed to write frame header")
 	}
 
-	return w.wr.Write(p)
+	// TODO can performance be improved if frame implemented WriteTo?
+	if _, err := io.Copy(w.wr, frame); err != nil {
+		return err
+	}
+	return nil
 }

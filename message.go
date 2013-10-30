@@ -15,52 +15,93 @@
 package zenio
 
 import (
+	"bytes"
 	"io"
+
+	"github.com/op/zenio/protocol"
 )
-
-// TODO does this interface even makes sense?
-
-type Message interface {
-	Reset()
-	Len() int
-	Bytes(int) []byte
-	AppendFrom(int, io.Reader) error
-}
-
-// TODO use bytes.Buffer or just a big array and make slices point into buffer.
 
 type BytesMessage struct {
 	buf [][]byte
 	idx int
 }
 
+func NewBytesMessage(frames [][]byte) *BytesMessage {
+	return &BytesMessage{frames, 0}
+}
+
 func (b *BytesMessage) Reset() {
 	b.idx = 0
 }
 
-func (b *BytesMessage) Len() int {
-	return b.idx
+func (b *BytesMessage) More() bool {
+	return b.idx < len(b.buf)
 }
 
-func (b *BytesMessage) Bytes(n int) []byte {
-	if n < 0 || n > b.idx {
-		panic("zenio: invalid frame")
-	}
-
-	return b.buf[n]
-}
-
-func (b *BytesMessage) AppendFrom(size int, rd io.Reader) error {
+func (b *BytesMessage) Next() (protocol.Frame, error) {
 	if b.idx >= len(b.buf) {
-		b.buf = append(b.buf, make([]byte, size))
-	} else if size > cap(b.buf[b.idx]) {
-		b.buf[b.idx] = make([]byte, size)
+		// TODO error
+		panic("zenio: out of range")
 	}
-	buf := b.buf[b.idx][:size]
-	if _, err := io.ReadFull(rd, buf); err != nil {
-		return err
+
+	defer func() { b.idx++ }()
+	return bytes.NewReader(b.buf[b.idx]), nil
+}
+
+// frameTeeReader is just like a io.TeeReader except it also
+// adds the Len() method expected by the protocol.Frame interface.
+type frameTeeReader struct {
+	tee io.Reader
+	f protocol.Frame
+}
+
+func newFrameTeeReader(f protocol.Frame, w io.Writer) *frameTeeReader {
+	return &frameTeeReader{io.TeeReader(f, w), f}
+}
+
+func (f *frameTeeReader) Read(p []byte) (int, error) {
+	return f.tee.Read(p)
+}
+
+func (f *frameTeeReader) Len() int {
+	return f.f.Len()
+}
+
+// BufferMessage adds buffering to a message. It makes it possible to read the
+// whole message into memory and rewind it again.
+type BufferMessage struct {
+	M protocol.Message
+	idx int
+	buf []*bytes.Buffer
+}
+
+func NewBufferMessage(m protocol.Message) *BufferMessage {
+	return &BufferMessage{M: m}
+}
+
+func (b *BufferMessage) Reset() {
+	b.idx = 0
+}
+
+func (b *BufferMessage) More() bool {
+	if b.idx < len(b.buf) {
+		return true
 	}
-	b.buf[b.idx] = buf
-	b.idx++
-	return nil
+	return b.M.More()
+}
+
+func (b *BufferMessage) Next() (protocol.Frame, error) {
+	defer func() { b.idx++ }()
+	if b.idx < len(b.buf) {
+		return bytes.NewReader(b.buf[b.idx].Bytes()), nil
+	}
+
+	f, err := b.M.Next()
+	if err != nil {
+		return nil, err
+	}
+
+	buf := &bytes.Buffer{}
+	b.buf = append(b.buf, buf)
+	return newFrameTeeReader(f, buf), nil
 }

@@ -24,17 +24,39 @@ import (
 	"errors"
 	"io"
 	"syscall"
+
+	"github.com/op/zenio/protocol"
 )
 
 const maxInt = int(^uint(0) >> 1)
 
-// ReadWriter wraps the Reader and Writer into one, making a composition which
-// implements io.ReadWriter.
-type ReadWriter struct {
-	Reader
-	Writer
+type singleFrame struct {
+	lr   *io.LimitedReader
+	read bool
 }
 
+func (sf *singleFrame) Read(p []byte) (n int, err error) {
+	return sf.lr.Read(p)
+}
+
+func (sf *singleFrame) Len() int {
+	return int(sf.lr.N)
+}
+
+func (sf *singleFrame) More() bool {
+	return !sf.read
+}
+
+func (sf *singleFrame) Next() (protocol.Frame, error) {
+	if sf.read {
+		// TODO return error
+		panic("out of range")
+	}
+	sf.read = true
+	return sf, nil
+}
+
+// TODO come up with a better name (FrameReader, Decoder?)
 // A Reader reads the wire format used for Scalable Protocols. First Read
 // will also parse the header.
 type Reader struct {
@@ -42,8 +64,7 @@ type Reader struct {
 	buf [8]byte
 
 	setupDone bool
-	peeked    bool
-	length    int
+	broken    bool
 }
 
 // NewReader returns a new Reader.
@@ -51,13 +72,20 @@ func NewReader(rd io.Reader) *Reader {
 	return &Reader{rd: rd}
 }
 
+// TODO split up to support symmetrical handshake. Rename.
 func (r *Reader) Init() error {
-	return r.setup()
+	err := r.setup()
+	if err != nil {
+		r.broken = true
+	}
+	return err
 }
 
 func (r *Reader) setup() error {
 	if r.setupDone {
 		return nil
+	} else if r.broken {
+		return errors.New("zenio: can't read from broken reader")
 	}
 
 	if _, err := io.ReadFull(r.rd, r.buf[0:8]); err != nil {
@@ -75,79 +103,32 @@ func (r *Reader) setup() error {
 	return nil
 }
 
-// Len is populated once Peek has been called and indicates the number of bytes
-// waiting to be read in the next call to Read.
-func (r *Reader) Len() int {
-	return r.length
-}
-
-// More is not implemented for SP and will always return false.
-func (r *Reader) More() bool {
-	return false
-}
-
-// Peek reads the length of the payload which is to be read in the next call to
-// Read.
-func (r *Reader) Peek() error {
+// length reads and returns the length of the payload which is expected to be
+// received.
+func (r *Reader) length() (int, error) {
 	if err := r.setup(); err != nil {
-		return err
-	} else if r.peeked {
-		return nil
+		return 0, err
 	}
 
 	if _, err := io.ReadFull(r.rd, r.buf[:]); err != nil {
-		return err
+		return 0, err
 	}
-
 	length := binary.BigEndian.Uint64(r.buf[:])
 	if length > uint64(maxInt) {
-		return syscall.EFBIG
+		return 0, syscall.EFBIG
 	}
-	r.length = int(length)
-	r.peeked = true
-	return nil
+	return int(length), nil
 }
 
 // Read reads the payload data into p.
-func (r *Reader) Read(p []byte) (int, error) {
-	if err := r.Peek(); err != nil {
-		return 0, err
-	}
-	r.peeked = false
-
-	l := r.length
-	if cap(p) < l {
-		l = cap(p)
-	}
-	n, err := r.rd.Read(p[:l])
+func (r *Reader) Read() (protocol.Message, error) {
+	length, err := r.length()
 	if err != nil {
-		return n, err
+		r.broken = true
+		return nil, err
 	}
-
-	// If the provided buffer is too small, we need to flush all unread data or
-	// the next call to Read will be in a weird state in case there's a call
-	// again after the error.
-	return r.flush(n, p)
-}
-
-func (r *Reader) flush(read int, p []byte) (int, error) {
-	unread := r.length - read
-	if unread > 0 {
-		var flush [128]byte
-		for unread > 0 {
-			s := unread
-			if s < len(flush) {
-				s = len(flush)
-			}
-			fn, ferr := r.rd.Read(flush[:])
-			if ferr != nil {
-				break
-			}
-			unread -= fn
-		}
-		return read, syscall.EFBIG
-	}
-	return read, nil
+	lr := &io.LimitedReader{r.rd, int64(length)}
+	return &singleFrame{lr: lr}, err
 }
 
 // A Writer writes the wire format used for Scalable Protocols. First Write
@@ -157,6 +138,7 @@ type Writer struct {
 	buf [8]byte
 
 	setupDone bool
+	broken    bool
 }
 
 // NewWriter returns a new Writer.
@@ -165,12 +147,18 @@ func NewWriter(wr io.Writer) *Writer {
 }
 
 func (w *Writer) Init() error {
-	return w.setup()
+	err := w.setup()
+	if err != nil {
+		w.broken = true
+	}
+	return err
 }
 
 func (w *Writer) setup() error {
 	if w.setupDone {
 		return nil
+	} else if w.broken {
+		return errors.New("zenio: can't write to broken writer")
 	}
 	// TODO investigate endpoint data
 	var buf = [8]byte{
@@ -189,24 +177,31 @@ func (w *Writer) setup() error {
 	return nil
 }
 
-// SetMore is not implemented for SP and will panic if tried to be set to true.
-func (w *Writer) SetMore(more bool) {
-	if more {
-		panic("zenio: sp does not support multiple frames")
-	}
-}
-
 // Write writes the payload.
-func (w *Writer) Write(p []byte) (int, error) {
-	if err := w.setup(); err != nil {
-		return 0, err
+func (w *Writer) Write(src protocol.Message) error {
+	frame, err := src.Next()
+	if err != nil {
+		return err
 	}
-	length := uint64(len(p))
-	binary.BigEndian.PutUint64(w.buf[:], length)
-	if n, err := w.wr.Write(w.buf[:]); err != nil {
-		return 0, err
-	} else if n != 8 {
-		return 0, errors.New("zenio: failed to write frame size")
+	if src.More() {
+		panic("Unsupported multiple frames")
+	} else if err := w.setup(); err != nil {
+		w.broken = true
+		return err
 	}
-	return w.wr.Write(p)
+
+	binary.BigEndian.PutUint64(w.buf[:], uint64(frame.Len()))
+	if written, err := w.wr.Write(w.buf[:]); err != nil {
+		w.broken = true
+		return err
+	} else if written != 8 {
+		w.broken = true
+		return errors.New("zenio: failed to write frame size")
+	}
+
+	if _, err := io.Copy(w.wr, frame); err != nil {
+		w.broken = true
+		return err
+	}
+	return nil
 }

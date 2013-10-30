@@ -26,30 +26,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/op/zenio/protocol"
 	"github.com/op/zenio/protocol/sp"
 	"github.com/op/zenio/protocol/zmtp"
 )
 
-type protocol int
+type protocolT int
 
 const (
-	protoSP protocol = iota
+	protoSP protocolT = iota
 	protoZMTP
 )
-
-type protocolReader interface {
-	io.Reader
-	Init() error
-	Peek() error
-	Len() int
-	More() bool
-}
-
-type protocolWriter interface {
-	io.Writer
-	Init() error
-	SetMore(bool)
-}
 
 // TODO add options for specific socket types. eg keep-alives for tcp etc.
 // TODO implement inproc using net.Pipe()? channels?
@@ -57,8 +44,13 @@ type protocolWriter interface {
 type Identity []byte
 
 type msgErrCh struct {
-	msg  Message
+	msg  protocol.Message
 	errc chan error
+}
+
+type msgErr struct {
+	msg protocol.Message
+	err error
 }
 
 // TODO add new type which contains multiple sockets
@@ -66,7 +58,7 @@ type msgErrCh struct {
 // TODO implement net.Conn
 // TODO implement net.Listener
 type socket struct {
-	recv  chan msgErrCh
+	recv  chan chan *msgErr
 	send  chan msgErrCh
 	peers []*peer
 	ident Identity
@@ -76,19 +68,19 @@ type socket struct {
 
 	network  string
 	address  string
-	protocol protocol
+	protocol protocolT
 }
 
 func newSocket(debug bool) *socket {
 	return &socket{
-		recv:  make(chan msgErrCh),
+		recv:  make(chan chan *msgErr),
 		send:  make(chan msgErrCh),
 		debug: debug,
 	}
 }
 
 func (s *socket) init(network string, address string) error {
-	var proto protocol
+	var proto protocolT
 	protoNet := strings.SplitN(network, "+", 2)
 	if len(protoNet) == 1 {
 		proto = protoSP
@@ -199,13 +191,14 @@ func (s *socket) Close() error {
 	return err
 }
 
-func (s *socket) Recv(msg Message) error {
-	errc := make(chan error, 1)
-	s.recv <- msgErrCh{msg, errc}
-	return <-errc
+func (s *socket) Recv() (protocol.Message, error) {
+	ch := make(chan *msgErr, 1)
+	s.recv <- ch
+	r := <- ch
+	return r.msg, r.err
 }
 
-func (s *socket) Send(msg Message) error {
+func (s *socket) Send(msg protocol.Message) error {
 	// TODO route message based on identity
 	errc := make(chan error, 1)
 	s.send <- msgErrCh{msg, errc}
@@ -286,7 +279,7 @@ func (p *peer) sender() {
 	}
 	buf := bufio.NewWriter(w)
 
-	var proto protocolWriter
+	var proto protocol.Writer
 	switch p.sock.protocol {
 	case protoSP:
 		proto = sp.NewWriter(buf)
@@ -306,22 +299,18 @@ func (p *peer) sender() {
 	for {
 		send := <-p.sock.send
 
-		var err error
-		for i := 0; i < send.msg.Len(); i++ {
-			proto.SetMore(i+1 < send.msg.Len())
-			if _, err = proto.Write(send.msg.Bytes(i)); err != nil {
-				break
-			}
-		}
-		if err == nil {
-			err = buf.Flush()
-		}
-		send.errc <- err
+		// TODO handle messages with no frames at all
 		if p.sock.debug {
 			p.sock.dmu.Lock()
 			dumper.Flush()
 			p.sock.dmu.Unlock()
 		}
+
+		err := proto.Write(send.msg)
+		if err == nil {
+			err = buf.Flush()
+		}
+		send.errc <- err
 	}
 }
 
@@ -333,7 +322,7 @@ func (p *peer) receiver() {
 		reader = io.TeeReader(reader, &dumper)
 	}
 
-	var proto protocolReader
+	var proto protocol.Reader
 	switch p.sock.protocol {
 	case protoSP:
 		proto = sp.NewReader(reader)
@@ -349,26 +338,15 @@ func (p *peer) receiver() {
 
 	// TODO detect when we can't receive and reconnect
 	for {
-		recv := <-p.sock.recv
-		recv.msg.Reset()
-
-		var err error
-		for {
-			if err = proto.Peek(); err != nil {
-				break
-			}
-			err = recv.msg.AppendFrom(proto.Len(), proto)
-			if !proto.More() {
-				break
-			}
-		}
-		recv.errc <- err
-
+		ch := <-p.sock.recv
 		if p.sock.debug {
 			p.sock.dmu.Lock()
 			dumper.Flush()
 			p.sock.dmu.Unlock()
 		}
+
+		msg, err := proto.Read()
+		ch <- &msgErr{msg, err}
 	}
 }
 

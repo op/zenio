@@ -3,7 +3,10 @@ package sp
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"testing"
+
+	"github.com/op/zenio/protocol"
 )
 
 var testCases = []struct {
@@ -46,21 +49,64 @@ var testCases = []struct {
 	},
 }
 
+// byteFrame is a memory based implementation of Message and Frame.
+type byteFrame struct {
+	frame []byte
+	r     *bytes.Reader
+}
+
+func newByteMessage(frame []byte) *byteFrame {
+	return &byteFrame{frame: frame}
+}
+
+func (b *byteFrame) More() bool {
+	return b.r == nil
+}
+
+func (b *byteFrame) Next() (protocol.Frame, error) {
+	if b.r != nil {
+		// TODO error
+		panic("out of range")
+	}
+	b.r = bytes.NewReader(b.frame)
+	return b.r, nil
+}
+
+func (b *byteFrame) rewind() bool {
+	b.r = nil
+	return true
+}
+
 func TestReader(t *testing.T) {
+	var (
+		err   error
+		msg   protocol.Message
+		frame protocol.Frame
+	)
 	for _, c := range testCases {
-		var (
-			n   int
-			err error
-		)
 		r := NewReader(bytes.NewReader(c.encoded))
 		for _, p := range c.decoded {
-			var buf [128]byte
-			if n, err = r.Read(buf[:]); err != nil {
+			var buf bytes.Buffer
+			msg, err = r.Read()
+			if err != nil {
 				break
-			} else if n != len(p) {
+			}
+			frame, err = msg.Next()
+			if err != nil {
+				break
+			} else if frame.Len() != len(p) {
 				t.Error("invalid length")
-			} else if !bytes.Equal(buf[:n], p) {
+			}
+			if n, err := io.Copy(&buf, frame); err != nil {
+				break
+			} else if n != int64(len(p)) {
+				t.Error("invalid length")
+			} else if !bytes.Equal(buf.Bytes(), p) {
 				t.Errorf("%#v != %#v", buf, p)
+			}
+
+			if msg.More() {
+				t.Fatal("more")
 			}
 		}
 
@@ -73,16 +119,14 @@ func TestReader(t *testing.T) {
 func TestWriter(t *testing.T) {
 	for _, c := range testCases {
 		var (
-			n   int
 			buf bytes.Buffer
 			err error
 		)
 		w := NewWriter(&buf)
 		for _, p := range c.decoded {
-			if n, err = w.Write(p); err != nil {
+			msg := newByteMessage(p)
+			if err = w.Write(msg); err != nil {
 				break
-			} else if n != len(p) {
-				t.Error("invalid length")
 			}
 		}
 
@@ -98,25 +142,39 @@ func TestWriter(t *testing.T) {
 func benchmarkReader(b *testing.B, size int64) {
 	b.SetBytes(size)
 
-	buf := make([]byte, size+8)
-	binary.BigEndian.PutUint64(buf[:], uint64(size))
-	br := bytes.NewReader(buf)
-	r := NewReader(br)
+	sp := make([]byte, size+8)
+	binary.BigEndian.PutUint64(sp[:], uint64(size))
+	spr := bytes.NewReader(sp)
+
+	r := NewReader(spr)
 	r.setupDone = true
-	p := make([]byte, size)
+
+	var buf bytes.Buffer
+	buf.Grow(int(size))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		br.Seek(0, 0)
-		if n, err := r.Read(p); err != nil {
+		spr.Seek(0, 0)
+		buf.Reset()
+		if msg, err := r.Read(); err != nil {
 			b.Fatal(err)
-		} else if n != len(p) {
-			b.Fatal("size")
+		} else {
+			frame, err := msg.Next()
+			if err != nil {
+				b.Fatal(err)
+			} else if n, err := io.Copy(&buf, frame); err != nil {
+				b.Fatal(err)
+			} else if n != size {
+				b.Fatal("size")
+			}
+			if msg.More() {
+				b.Fatal("more")
+			}
 		}
 	}
 }
 
-func BenchmarkSPReader(b *testing.B) {
+func BenchmarkSPReader128(b *testing.B) {
 	benchmarkReader(b, 128)
 }
 
@@ -133,13 +191,14 @@ func benchmarkWriter(b *testing.B, size int64) {
 	p := make([]byte, size)
 	buf.Grow(int(size) * 2)
 
+	msg := newByteMessage(p)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		if n, err := w.Write(p); err != nil {
+		msg.rewind()
+		if err := w.Write(msg); err != nil {
 			b.Fatal(err)
-		} else if n != len(p) {
-			b.Fatal("size")
 		}
 	}
 }

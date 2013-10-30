@@ -27,15 +27,15 @@ func main() {
 	}
 	defer ln.Close()
 
-	var msg zenio.BytesMessage
 	for i := 0; i < *roundtripCount; i++ {
-		if err := ln.Recv(&msg); err != nil {
+		msg, err := ln.Recv()
+		if err != nil {
 			if err != io.EOF {
 				panic(err)
 			}
 		}
 
-		if err := ln.Send(&msg); err != nil {
+		if err := ln.Send(msg); err != nil {
 			op, ok := err.(*net.OpError)
 			if ok {
 				switch op.Err {

@@ -16,6 +16,8 @@
 // dependencies on zeromq or nanomsg.
 package zenio
 
+import "github.com/op/zenio/protocol"
+
 // TODO use envelope as a way to do versioning of protocols?
 // TODO do we need to pass in information as eg. Pattern (req/rep)?
 
@@ -28,9 +30,9 @@ type Envelope interface {
 type Protocol interface {
 	// Send encodes the protocol data from Envelope and Message and writes it to
 	// the underlying writer.
-	Send(Envelope, Message) error
+	Send(Envelope, protocol.Message) error
 
 	// Recv reads protocol data from the underlying reader and decodes it into
 	// Envelope and Message.
-	Recv(Envelope, Message) error
+	Recv(Envelope, protocol.Message) error
 }

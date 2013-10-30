@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"syscall"
 	"time"
@@ -30,14 +31,15 @@ func main() {
 	}
 	defer conn.Close()
 
-	var msg zenio.BytesMessage
-	frame := bytes.Repeat([]byte("o"), *messageSize)
-	msg.AppendFrom(*messageSize, bytes.NewReader(frame))
+	var frames [][]byte
+	frames = append(frames, bytes.Repeat([]byte("o"), *messageSize))
+	msg := zenio.NewBytesMessage(frames)
 
 	watch := perf.NewStopWatch()
 
 	for i := 0; i < *roundtripCount; i++ {
-		if err := conn.Send(&msg); err != nil {
+		msg.Reset()
+		if err := conn.Send(msg); err != nil {
 			op, ok := err.(*net.OpError)
 			if ok {
 				switch op.Err {
@@ -54,9 +56,19 @@ func main() {
 		}
 
 		// rep
-		if err := conn.Recv(&msg); err != nil {
+		if r, err := conn.Recv(); err != nil {
 			if err != io.EOF {
 				panic(err)
+			}
+		} else {
+			for r.More() {
+				frame, err := r.Next()
+				if err != nil {
+					panic(err)
+				}
+				if _, err = io.Copy(ioutil.Discard, frame); err != nil {
+					panic(err)
+				}
 			}
 		}
 	}

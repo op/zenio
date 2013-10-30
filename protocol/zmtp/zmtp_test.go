@@ -3,8 +3,11 @@ package zmtp
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"syscall"
 	"testing"
+
+	"github.com/op/zenio/protocol"
 )
 
 var testCases = []struct {
@@ -84,10 +87,8 @@ var testCases = []struct {
 		skipEnc: true,
 		encoded: []byte{
 			0x01, 0x00, // header
-			0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, // length
+			0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // length, 1<<63+1
 			0x00, // flags
-			// 0x100 bytes added in init(), which is > the buffer of
-			// 0xff passed in when reading
 		},
 		decoded: [][]byte{
 			{},
@@ -102,8 +103,36 @@ func init() {
 		tc.decoded = append(tc.decoded, make([]byte, size))
 	}
 	addBytesToTestCase(4, 0xff)
-	addBytesToTestCase(7, 0x100)
 	testCases[5].ident = make([]byte, 0xff)
+}
+
+// byteMessage is a simple memory based Message implementation.
+type byteMessage struct {
+	frames [][]byte
+	idx    int
+}
+
+func newByteMessage(frames [][]byte) *byteMessage {
+	return &byteMessage{frames, 0}
+}
+func (m *byteMessage) More() bool {
+	return m.idx < len(m.frames)
+}
+
+func (m *byteMessage) Next() (protocol.Frame, error) {
+	if m.idx >= len(m.frames) {
+		// TODO error
+		panic("zenio: out of range")
+	}
+
+	frame := m.frames[m.idx]
+	m.idx++
+	return bytes.NewReader(frame), nil
+}
+
+func (m *byteMessage) rewind() bool {
+	m.idx = 0
+	return true
 }
 
 func TestReader(t *testing.T) {
@@ -112,28 +141,43 @@ func TestReader(t *testing.T) {
 			continue
 		}
 		var (
-			n   int
-			err error
+			j     int
+			n     int64
+			err   error
+			msg   protocol.Message
+			frame protocol.Frame
 		)
 		r := NewReader(bytes.NewReader(c.encoded))
-		for i, p := range c.decoded {
-			var buf [0xff]byte
-			if n, err = r.Read(buf[:]); err != nil {
+		if msg, err = r.Read(); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range c.decoded {
+			frame, err = msg.Next()
+			j++
+			if err != nil {
 				break
-			} else if n != len(p) {
+			} else if frame.Len() != len(p) {
 				t.Errorf("%d invalid length", i)
-			} else if !bytes.Equal(buf[:n], p) {
+			}
+
+			var buf bytes.Buffer
+			if n, err = io.Copy(&buf, frame); err != nil {
+				break
+			} else if n != int64(len(p)) {
+				t.Errorf("%d invalid length", i)
+			} else if !bytes.Equal(buf.Bytes(), p) {
 				t.Errorf("%d %#v != %#v", i, buf, p)
 			}
 
-			more := i+1 < len(c.decoded)
-			if r.More() != more {
-				t.Errorf("%d %v != %v", r.More(), more)
+			if !msg.More() {
+				break
 			}
 		}
 
 		if err != c.err {
 			t.Errorf("%d %#v != %#v", i, err, c.err)
+		} else if msg.More() {
+			t.Fatal("not all frames consumed")
 		}
 	}
 }
@@ -145,21 +189,14 @@ func TestWriter(t *testing.T) {
 			continue
 		}
 		var (
-			n   int
 			buf bytes.Buffer
 			err error
 		)
 		w := NewWriter(&buf)
 		w.Identity = c.ident
-		for i, p := range c.decoded {
-			w.SetMore(i+1 < len(c.decoded))
-			if n, err = w.Write(p); err != nil {
-				break
-			} else if n != len(p) {
-				t.Errorf("invalid length", i)
-			}
-		}
 
+		msg := newByteMessage(c.decoded)
+		err = w.Write(msg)
 		if err != c.err {
 			t.Errorf("%d %#v != %#v", i, err, c.err)
 		} else if !bytes.Equal(buf.Bytes(), c.encoded) {
@@ -173,26 +210,41 @@ func benchmarkReader(b *testing.B, size int64) {
 
 	// Setup the buffer differently depending on the size of the run. Also,
 	// leave one extra byte for the frame flags.
-	buf := make([]byte, size+1+8+1)
+	zmtp := make([]byte, size+1+8+1)
 	if size+1 < 0xff {
-		buf[0] = uint8(size) + 1
+		zmtp[0] = uint8(size) + 1
 	} else {
-		buf[0] = 0xff
-		binary.BigEndian.PutUint64(buf[1:], uint64(size+1))
+		zmtp[0] = 0xff
+		binary.BigEndian.PutUint64(zmtp[1:], uint64(size+1))
 	}
 
-	br := bytes.NewReader(buf)
-	r := NewReader(br)
+	zmtpr := bytes.NewReader(zmtp)
+	r := NewReader(zmtpr)
 	r.setupDone = true
-	p := make([]byte, size)
+
+	var buf bytes.Buffer
+	buf.Grow(int(size))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		br.Seek(0, 0)
-		if n, err := r.Read(p); err != nil {
+		zmtpr.Seek(0, 0)
+		buf.Reset()
+
+		msg, err := r.Read()
+		if err != nil {
 			b.Fatal(err)
-		} else if n != len(p) {
-			b.Fatal("size")
+		}
+		if frame, err := msg.Next(); err != nil {
+			b.Fatal(err)
+		} else {
+			frameLen := frame.Len()
+			if written, err := io.Copy(&buf, frame); err != nil {
+				b.Fatal(err)
+			} else if buf.Len() != frameLen || written != int64(buf.Len()) {
+				b.Fatal("size")
+			} else if msg.More() {
+				b.Fatal("more")
+			}
 		}
 	}
 }
@@ -208,18 +260,26 @@ func BenchmarkZMTPReader1024k(b *testing.B) {
 func benchmarkWriter(b *testing.B, size int64) {
 	b.SetBytes(size)
 
+	expectedSize := int(size) + 2
+	if size+1 >= 0xff {
+		expectedSize += 8
+	}
+
 	var buf bytes.Buffer
+	buf.Grow(expectedSize)
 	w := NewWriter(&buf)
 	w.setupDone = true
+
 	p := make([]byte, size)
-	buf.Grow(int(size) * 2)
+	msg := newByteMessage([][]byte{p})
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
-		if n, err := w.Write(p); err != nil {
+		msg.rewind()
+		if err := w.Write(msg); err != nil {
 			b.Fatal(err)
-		} else if n != len(p) {
+		} else if buf.Len() != expectedSize {
 			b.Fatal("size")
 		}
 	}
