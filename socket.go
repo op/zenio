@@ -336,6 +336,8 @@ func (p *peer) receiver() {
 		panic(err)
 	}
 
+	pipeline := newPipelinedReader(proto)
+
 	// TODO detect when we can't receive and reconnect
 	for {
 		ch := <-p.sock.recv
@@ -345,7 +347,9 @@ func (p *peer) receiver() {
 			p.sock.dmu.Unlock()
 		}
 
-		msg, err := proto.Read()
+		// TODO allow timeout to happen when no reader can be fetched in time
+		pipe := <-pipeline.reader()
+		msg, err := pipe.Read()
 		ch <- &msgErr{msg, err}
 	}
 }
