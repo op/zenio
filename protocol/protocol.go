@@ -19,19 +19,19 @@ import (
 	"io"
 )
 
+type Negotiator interface {
+	Upgrade(io.Reader, io.Writer) (Reader, Writer, error)
+}
+
 // TODO ZMTP has greeting, handshake and traffic
-// TODO add asymetric greeting
 // TODO add heartbeating
 type Reader interface {
-	Init() error
 	Read() (Message, error)
 }
 
 type Writer interface {
-	Init() error
 	Write(Message) error
 }
-
 
 // XXX bytes.Reader implements this interface
 type Frame interface {
@@ -45,17 +45,4 @@ type Frame interface {
 type Message interface {
 	Next() (Frame, error)
 	More() bool
-}
-
-
-// type ReadWriter interface {
-// 	Reader
-// 	Writer
-// }
-
-type MoreReadCloser interface {
-	More() bool
-	// TODO io.ReadSeeker + io.Closer?
-	// TODO get rid of Closer?
-	io.ReadCloser
 }

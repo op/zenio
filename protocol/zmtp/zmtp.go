@@ -47,93 +47,91 @@ const (
 
 const maxInt = int(^uint(0) >> 1)
 
-type frame struct {
-	lr *io.LimitedReader
-}
-
-func (f *frame) Read(p []byte) (int, error) {
-	return f.lr.Read(p)
-}
-
-func (f *frame) Len() int {
-	return int(f.lr.N)
-}
-
-type frameReader struct {
-	r    *Reader
-	last *frame
-	more bool
-}
-
-func (fr *frameReader) More() bool {
-	return fr.more
-}
-
-func (fr *frameReader) Next() (frame protocol.Frame, err error) {
-	if fr.last != nil {
-		if fr.last.Len() > 0 {
-			panic("previous frame not fully consumed")
-		} else if !fr.more {
-			// TODO return io.EOF?
-			panic("no more frames available")
-		}
-	}
-	fr.last, fr.more, err = fr.r.readFrame()
-	return fr.last, err
-}
-
-// A Reader reads ZMTP data from a reader. First Read will also read header
-// data.
-type Reader struct {
-	rd  io.Reader
-	buf [10]byte
-
-	setupDone bool
-	broken    bool
-
+type Negotiator struct {
+	// Identity is used as an addressing mechanism in ZMTP. If not specified, the
+	// anonymous identity will be used. The maximum length is 254 bytes and should
+	// not start with 0x00.
 	Identity []byte
 }
 
-// NewReader returns a new Reader.
-func NewReader(rd io.Reader) *Reader {
-	return &Reader{rd: rd}
+// Upgrade performs the handshake as defined by ZMTP and upgrades the given r
+// and w to a reader and writer capable of communicating with the other node
+// using ZMTP.
+func (h *Negotiator) Upgrade(r io.Reader, w io.Writer) (protocol.Reader, protocol.Writer, error) {
+	// TODO make asymmetric and react to what's beeing received.
+	if err := h.send(w); err != nil {
+		return nil, nil, err
+	}
+	// FIXME HACK
+	if err := protocol.Flush(w); err != nil {
+		return nil, nil, err
+	}
+	if err := h.recv(r); err != nil {
+		return nil, nil, err
+	}
+	return newReader(r), newWriter(w), nil
 }
 
-// TODO rename to Handshake or similar, and make symmetric
-func (r *Reader) Init() error {
-	err := r.setup()
-	if err != nil {
-		r.broken = true
-	}
-	return err
-}
-
-func (r *Reader) setup() error {
-	if r.setupDone {
-		return nil
-	} else if r.broken {
-		return errors.New("zenio: can't read from broken stream")
-	}
-	if _, err := io.ReadFull(r.rd, r.buf[0:2]); err != nil {
+func (h *Negotiator) recv(r io.Reader) error {
+	var buf [2]byte
+	if _, err := io.ReadFull(r, buf[0:2]); err != nil {
 		return err
 	}
 
-	length := uint8(r.buf[0]) - 1
+	length := uint8(buf[0]) - 1
 	// skip buf[1] (idflags isn't used)
 
 	if length > 0 {
-		r.Identity = make([]byte, length)
-		if _, err := io.ReadFull(r.rd, r.Identity); err != nil {
+		// TODO expose received identity?
+		identity := make([]byte, length)
+		if _, err := io.ReadFull(r, identity); err != nil {
 			return err
 		}
 	}
-
-	r.setupDone = true
-
 	return nil
 }
 
-func (r *Reader) readFrame() (f *frame, more bool, err error) {
+func (h *Negotiator) send(w io.Writer) error {
+	// The identity can be at max 254 bytes (1 byte for flags)
+	if len(h.Identity) >= 0xff {
+		return errIdentTooBig
+	}
+
+	var buf [2]byte
+	buf[0] = uint8(len(h.Identity)) + 1
+	buf[1] = 0
+	if n, err := w.Write(buf[0:2]); err != nil {
+		return err
+	} else if n != 2 {
+		return errors.New("zenio: failed to write identity header")
+	}
+
+	// Write no identity if there's none (known as anonymous)
+	if len(h.Identity) > 0 {
+		if h.Identity[0] == 0 {
+			return errIdentReserved
+		}
+		if n, err := w.Write(h.Identity); err != nil {
+			return err
+		} else if n != len(h.Identity) {
+			return errors.New("zenio: failed to write identity")
+		}
+	}
+	return nil
+}
+
+// reader reads ZMTP data from a reader.
+type reader struct {
+	rd     io.Reader
+	buf    [10]byte
+	broken bool
+}
+
+func newReader(rd io.Reader) *reader {
+	return &reader{rd: rd}
+}
+
+func (r *reader) readFrame() (f *frame, more bool, err error) {
 	if r.broken {
 		return nil, false, errors.New("zenio: can't read from broken stream")
 	}
@@ -175,85 +173,28 @@ func (r *Reader) readFrame() (f *frame, more bool, err error) {
 }
 
 // Read reads the payload data into p.
-func (r *Reader) Read() (protocol.Message, error) {
-	if err := r.setup(); err != nil {
-		r.broken = true
-		return nil, err
+func (r *reader) Read() (protocol.Message, error) {
+	// FIXME make sure broken is populated correctly
+	if r.broken {
+		return nil, errors.New("zenio: can't read from broken stream")
 	}
 	return &frameReader{r: r, more: true}, nil
 }
 
-// Writer writes the data according to ZMTP. First write will initiate the
+// writer writes the data according to ZMTP. First write will initiate the
 // format by writing header data.
-type Writer struct {
-	wr  io.Writer
-	buf [10]byte
-
-	setupDone bool
-	broken    bool
-
-	// Identity is used as an addressing mechanism in ZMTP. If not specified, the
-	// anonymous identity will be used. The maximum length is 254 bytes and should
-	// not start with 0x00.
-	//
-	// This field is only relevant before the first call to Write.
-	Identity []byte
+type writer struct {
+	wr     io.Writer
+	buf    [10]byte
+	broken bool
 }
 
-// NewWriter returns a new Writer.
-func NewWriter(wr io.Writer) *Writer {
-	return &Writer{wr: wr}
-}
-
-func (w *Writer) Init() error {
-	return w.setup()
-}
-
-func (w *Writer) setup() error {
-	if w.setupDone {
-		return nil
-	} else if w.broken {
-		return errors.New("zenio: can't write to broken stream")
-	}
-
-	// The identity can be at max 254 bytes (1 byte for flags)
-	if len(w.Identity) >= 0xff {
-		return errIdentTooBig
-	}
-
-	w.buf[0] = uint8(len(w.Identity)) + 1
-	w.buf[1] = 0
-	if n, err := w.wr.Write(w.buf[0:2]); err != nil {
-		return err
-	} else if n != 2 {
-		return errors.New("zenio: failed to write identity header")
-	}
-
-	// Write no identity if there's none (known as anonymous)
-	if len(w.Identity) > 0 {
-		if w.Identity[0] == 0 {
-			return errIdentReserved
-		}
-		if n, err := w.wr.Write(w.Identity); err != nil {
-			return err
-		} else if n != len(w.Identity) {
-			return errors.New("zenio: failed to write identity")
-		}
-	}
-
-	w.setupDone = true
-
-	return nil
+func newWriter(wr io.Writer) *writer {
+	return &writer{wr: wr}
 }
 
 // Write writes the payload.
-func (w *Writer) Write(src protocol.Message) error {
-	var err error
-	if err = w.setup(); err != nil {
-		w.broken = true
-		return err
-	}
-
+func (w *writer) Write(src protocol.Message) error {
 	for {
 		frame, err := src.Next()
 		if err = w.writeFrame(frame, src.More()); err != nil {
@@ -267,7 +208,7 @@ func (w *Writer) Write(src protocol.Message) error {
 	return nil
 }
 
-func (w *Writer) writeFrame(frame protocol.Frame, more bool) error {
+func (w *writer) writeFrame(frame protocol.Frame, more bool) error {
 	// Setup the length of the frame. If the length is < 0xff, only one
 	// byte is needed. For bigger frames, the first byte is 0xff and the
 	// next 8 bytes consists of the length.
@@ -301,4 +242,39 @@ func (w *Writer) writeFrame(frame protocol.Frame, more bool) error {
 		return err
 	}
 	return nil
+}
+
+type frame struct {
+	lr *io.LimitedReader
+}
+
+func (f *frame) Read(p []byte) (int, error) {
+	return f.lr.Read(p)
+}
+
+func (f *frame) Len() int {
+	return int(f.lr.N)
+}
+
+type frameReader struct {
+	r    *reader
+	last *frame
+	more bool
+}
+
+func (fr *frameReader) More() bool {
+	return fr.more
+}
+
+func (fr *frameReader) Next() (frame protocol.Frame, err error) {
+	if fr.last != nil {
+		if fr.last.Len() > 0 {
+			panic("previous frame not fully consumed")
+		} else if !fr.more {
+			// TODO return io.EOF?
+			panic("no more frames available")
+		}
+	}
+	fr.last, fr.more, err = fr.r.readFrame()
+	return fr.last, err
 }

@@ -10,6 +10,50 @@ import (
 	"github.com/op/zenio/protocol"
 )
 
+func TestNegotiator(t *testing.T) {
+	var cases = []struct {
+		err      error
+		encoded  []byte
+		identity []byte
+	}{
+		{
+			encoded: []byte{0x01, 0x00},
+		}, {
+			encoded:  []byte{0x04, 0x00, 0x01, 0x02, 0x03},
+			identity: []byte{0x01, 0x02, 0x03},
+		}, {
+			encoded:  []byte{0x07, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06},
+			identity: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06},
+		}, {
+			err:      errIdentTooBig,
+			encoded:  bytes.Repeat([]byte{0x00}, 0xff),
+			identity: bytes.Repeat([]byte{0x00}, 0xff),
+		}, {
+			err:      errIdentReserved,
+			encoded:  []byte{0x02, 0x00},
+			identity: []byte{0x00},
+		},
+	}
+
+	var n Negotiator
+	for _, c := range cases {
+		var buf bytes.Buffer
+		n.Identity = c.identity
+		_, _, err := n.Upgrade(bytes.NewReader(c.encoded), &buf)
+		if err != nil {
+			if err != c.err {
+				t.Errorf("err")
+			}
+			continue
+		}
+
+		if !bytes.Equal(buf.Bytes(), c.encoded) {
+			t.Errorf("%#v != %#v", buf.Bytes(), c.encoded)
+		}
+		// TODO verify read identity once it's exposed
+	}
+}
+
 var testCases = []struct {
 	err     error
 	ident   []byte
@@ -20,7 +64,6 @@ var testCases = []struct {
 }{
 	{
 		encoded: []byte{
-			0x01, 0x00, // header, anonymous ident
 			0x01, 0x00, // length and flags
 		},
 		decoded: [][]byte{
@@ -28,16 +71,6 @@ var testCases = []struct {
 		},
 	}, {
 		encoded: []byte{
-			0x04, 0x00, 0x01, 0x02, 0x03, // header, with ident
-			0x01, 0x00, // length and flags
-		},
-		ident: []byte{0x01, 0x02, 0x03},
-		decoded: [][]byte{
-			{},
-		},
-	}, {
-		encoded: []byte{
-			0x01, 0x00, // header
 			0x06, 0x00, // length and flags
 			'h', 'e', 'l', 'l', 'o',
 		},
@@ -46,20 +79,17 @@ var testCases = []struct {
 		},
 	}, {
 		encoded: []byte{
-			0x07, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // header
 			0x03, 0x01, // length + more flag
 			'p', '1',
 			0x03, 0x00, // length
 			'p', '2',
 		},
-		ident: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06},
 		decoded: [][]byte{
 			[]byte("p1"),
 			[]byte("p2"),
 		},
 	}, {
 		encoded: []byte{
-			0x01, 0x00, // header
 			0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, // length
 			0x00, // flags
 			// 0xff bytes added in init()
@@ -68,25 +98,9 @@ var testCases = []struct {
 		// 0xff bytes added in init()
 		},
 	}, {
-		err:     errIdentTooBig,
-		skipDec: true,
-		// ident added in init() to be have len >= 0xff
-		decoded: [][]byte{{}},
-	}, {
-		err:     errIdentReserved,
-		skipDec: true,
-		ident:   []byte{0x00}, // illegal ident
-		encoded: []byte{
-			0x02, 0x00,
-		},
-		decoded: [][]byte{
-			{},
-		},
-	}, {
 		err:     syscall.EFBIG,
 		skipEnc: true,
 		encoded: []byte{
-			0x01, 0x00, // header
 			0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // length, 1<<63+1
 			0x00, // flags
 		},
@@ -102,8 +116,7 @@ func init() {
 		tc.encoded = append(tc.encoded, make([]byte, size)...)
 		tc.decoded = append(tc.decoded, make([]byte, size))
 	}
-	addBytesToTestCase(4, 0xff)
-	testCases[5].ident = make([]byte, 0xff)
+	addBytesToTestCase(3, 0xff)
 }
 
 // byteMessage is a simple memory based Message implementation.
@@ -147,7 +160,7 @@ func TestReader(t *testing.T) {
 			msg   protocol.Message
 			frame protocol.Frame
 		)
-		r := NewReader(bytes.NewReader(c.encoded))
+		r := newReader(bytes.NewReader(c.encoded))
 		if msg, err = r.Read(); err != nil {
 			t.Fatal(err)
 		}
@@ -192,8 +205,7 @@ func TestWriter(t *testing.T) {
 			buf bytes.Buffer
 			err error
 		)
-		w := NewWriter(&buf)
-		w.Identity = c.ident
+		w := newWriter(&buf)
 
 		msg := newByteMessage(c.decoded)
 		err = w.Write(msg)
@@ -210,7 +222,7 @@ func benchmarkReader(b *testing.B, size int64) {
 
 	// Setup the buffer differently depending on the size of the run. Also,
 	// leave one extra byte for the frame flags.
-	zmtp := make([]byte, size+1+8+1)
+	zmtp := make([]byte, 1+8+1+size)
 	if size+1 < 0xff {
 		zmtp[0] = uint8(size) + 1
 	} else {
@@ -219,8 +231,7 @@ func benchmarkReader(b *testing.B, size int64) {
 	}
 
 	zmtpr := bytes.NewReader(zmtp)
-	r := NewReader(zmtpr)
-	r.setupDone = true
+	r := newReader(zmtpr)
 
 	var buf bytes.Buffer
 	buf.Grow(int(size))
@@ -267,8 +278,7 @@ func benchmarkWriter(b *testing.B, size int64) {
 
 	var buf bytes.Buffer
 	buf.Grow(expectedSize)
-	w := NewWriter(&buf)
-	w.setupDone = true
+	w := newWriter(&buf)
 
 	p := make([]byte, size)
 	msg := newByteMessage([][]byte{p})

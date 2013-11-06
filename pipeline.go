@@ -37,10 +37,6 @@ func (p *pipelinedReader) reader() <-chan protocol.Reader {
 	return p.queue
 }
 
-func (p *pipelinedReader) Init() error {
-	return p.r.Init()
-}
-
 func (p *pipelinedReader) Read() (protocol.Message, error) {
 	// Wrap the message which triggers the reader to gets added back to the
 	// queue once the previous action is finished.

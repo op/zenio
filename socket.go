@@ -18,7 +18,6 @@ package zenio
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,13 +28,6 @@ import (
 	"github.com/op/zenio/protocol"
 	"github.com/op/zenio/protocol/sp"
 	"github.com/op/zenio/protocol/zmtp"
-)
-
-type protocolT int
-
-const (
-	protoSP protocolT = iota
-	protoZMTP
 )
 
 // TODO add options for specific socket types. eg keep-alives for tcp etc.
@@ -68,7 +60,9 @@ type socket struct {
 
 	network  string
 	address  string
-	protocol protocolT
+	protocol string
+
+	neg protocol.Negotiator
 }
 
 func newSocket(debug bool) *socket {
@@ -80,24 +74,24 @@ func newSocket(debug bool) *socket {
 }
 
 func (s *socket) init(network string, address string) error {
-	var proto protocolT
+	var proto = "sp"
 	protoNet := strings.SplitN(network, "+", 2)
-	if len(protoNet) == 1 {
-		proto = protoSP
-	} else {
-		switch protoNet[0] {
-		case "sp":
-			proto = protoSP
-		case "zmtp":
-			proto = protoZMTP
-		default:
-			return errors.New("zenio: unsupported protocol: " + protoNet[0])
-		}
+	if len(protoNet) == 2 {
+		proto = protoNet[0]
 		network = protoNet[1]
 	}
 	s.network = network
 	s.address = address
 	s.protocol = proto
+
+	switch s.protocol {
+	case "sp":
+		s.neg = &sp.Negotiator{}
+	case "zmtp":
+		s.neg = &zmtp.Negotiator{Identity: s.ident}
+	default:
+		panic("unhandled protocol: " + s.protocol)
+	}
 
 	switch s.network {
 	case "tcp":
@@ -194,7 +188,7 @@ func (s *socket) Close() error {
 func (s *socket) Recv() (protocol.Message, error) {
 	ch := make(chan *msgErr, 1)
 	s.recv <- ch
-	r := <- ch
+	r := <-ch
 	return r.msg, r.err
 }
 
@@ -216,6 +210,22 @@ type peer struct {
 	// dialer  net.Dialer
 }
 
+type flusher interface {
+	Flush() error
+}
+
+type reader struct {
+	pr protocol.Reader
+	br *bufio.Reader
+	hd *hexDumper
+}
+
+type writer struct {
+	pw protocol.Writer
+	bw *bufio.Writer
+	hd *hexDumper
+}
+
 func newConnPeer(sock *socket, network, address string) (*peer, error) {
 	peer := &peer{
 		sock:    sock,
@@ -227,8 +237,12 @@ func newConnPeer(sock *socket, network, address string) (*peer, error) {
 	if err := peer.connect(); err != nil {
 		return nil, err
 	}
-	go peer.sender()
-	go peer.receiver()
+	r, w, err := peer.handshake()
+	if err != nil {
+		return nil, err
+	}
+	go peer.sender(w)
+	go peer.receiver(r)
 
 	return peer, nil
 }
@@ -238,8 +252,12 @@ func newListenPeer(sock *socket, conn net.Conn) (*peer, error) {
 		sock: sock,
 		conn: conn,
 	}
-	go peer.sender()
-	go peer.receiver()
+	r, w, err := peer.handshake()
+	if err != nil {
+		return nil, err
+	}
+	go peer.sender(w)
+	go peer.receiver(r)
 
 	return peer, nil
 }
@@ -270,86 +288,67 @@ func (p *peer) connect() error {
 	return nil
 }
 
-func (p *peer) sender() {
-	var dumper = hexDumper{Prefix: ">> "}
-
+func (p *peer) handshake() (*reader, *writer, error) {
+	var dr, dw *hexDumper
 	var w io.Writer = p.conn
+	var r io.Reader = p.conn
+
+	br := bufio.NewReader(r)
+	r = br
+
 	if p.sock.debug {
-		w = io.MultiWriter(w, &dumper)
-	}
-	buf := bufio.NewWriter(w)
-
-	var proto protocol.Writer
-	switch p.sock.protocol {
-	case protoSP:
-		proto = sp.NewWriter(buf)
-	case protoZMTP:
-		proto = zmtp.NewWriter(buf)
-	default:
-		panic("unhandled protocol")
+		dw = &hexDumper{Prefix: "» "}
+		w = io.MultiWriter(w, dw)
+		dr = &hexDumper{Prefix: "« "}
+		r = io.TeeReader(r, dr)
 	}
 
-	if err := proto.Init(); err != nil {
-		panic(err)
-	} else if err := buf.Flush(); err != nil {
-		panic(err)
+	bw := bufio.NewWriter(w)
+
+	pr, pw, err := p.sock.neg.Upgrade(br, bw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &reader{pr, br, dr}, &writer{pw, bw, dw}, err
+}
+
+func (p *peer) sender(w *writer) {
+	if w.hd != nil {
+		w.hd.Flush()
 	}
 
 	// TODO detect when we can't send
 	for {
 		send := <-p.sock.send
-
-		// TODO handle messages with no frames at all
-		if p.sock.debug {
-			p.sock.dmu.Lock()
-			dumper.Flush()
-			p.sock.dmu.Unlock()
-		}
-
-		err := proto.Write(send.msg)
+		err := w.pw.Write(send.msg)
 		if err == nil {
-			err = buf.Flush()
+			err = w.bw.Flush()
+		}
+		if w.hd != nil {
+			w.hd.Flush()
 		}
 		send.errc <- err
 	}
 }
 
-func (p *peer) receiver() {
-	var dumper = hexDumper{Prefix: "<< "}
-
-	var reader io.Reader = bufio.NewReader(p.conn)
-	if p.sock.debug {
-		reader = io.TeeReader(reader, &dumper)
+func (p *peer) receiver(r *reader) {
+	if r.hd != nil {
+		r.hd.Flush()
 	}
 
-	var proto protocol.Reader
-	switch p.sock.protocol {
-	case protoSP:
-		proto = sp.NewReader(reader)
-	case protoZMTP:
-		proto = zmtp.NewReader(reader)
-	default:
-		panic("unhandled protocol")
-	}
-
-	if err := proto.Init(); err != nil {
-		panic(err)
-	}
-
-	pipeline := newPipelinedReader(proto)
+	pipeline := newPipelinedReader(r.pr)
 
 	// TODO detect when we can't receive and reconnect
 	for {
 		ch := <-p.sock.recv
-		if p.sock.debug {
-			p.sock.dmu.Lock()
-			dumper.Flush()
-			p.sock.dmu.Unlock()
-		}
 
 		// TODO allow timeout to happen when no reader can be fetched in time
 		pipe := <-pipeline.reader()
+
 		msg, err := pipe.Read()
+		if r.hd != nil {
+			r.hd.Flush()
+		}
 		ch <- &msgErr{msg, err}
 	}
 }

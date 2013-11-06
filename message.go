@@ -52,7 +52,7 @@ func (b *BytesMessage) Next() (protocol.Frame, error) {
 // adds the Len() method expected by the protocol.Frame interface.
 type frameTeeReader struct {
 	tee io.Reader
-	f protocol.Frame
+	f   protocol.Frame
 }
 
 func newFrameTeeReader(f protocol.Frame, w io.Writer) *frameTeeReader {
@@ -70,7 +70,7 @@ func (f *frameTeeReader) Len() int {
 // BufferMessage adds buffering to a message. It makes it possible to read the
 // whole message into memory and rewind it again.
 type BufferMessage struct {
-	M protocol.Message
+	M   protocol.Message
 	idx int
 	buf []*bytes.Buffer
 }

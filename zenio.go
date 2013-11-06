@@ -26,6 +26,7 @@ type Envelope interface {
 }
 
 // TODO add handshake?
+// TODO io.ReadSeeker is nice because we can retry send + get size of data to send
 
 type Protocol interface {
 	// Send encodes the protocol data from Envelope and Message and writes it to

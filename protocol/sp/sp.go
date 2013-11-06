@@ -30,6 +30,132 @@ import (
 
 const maxInt = int(^uint(0) >> 1)
 
+type Negotiator struct{}
+
+// Upgrade performs the handshake as defined by the Scalable Protocols and
+// upgrades the given r and w to a reader and writer capable of communicating
+// with the other node using Scalable Protocols.
+func (h *Negotiator) Upgrade(r io.Reader, w io.Writer) (protocol.Reader, protocol.Writer, error) {
+	// TODO make asymmetric and react to what's beeing received.
+	if err := h.send(w); err != nil {
+		return nil, nil, err
+	}
+	// FIXME HACK
+	if err := protocol.Flush(w); err != nil {
+		return nil, nil, err
+	}
+	if err := h.recv(r); err != nil {
+		return nil, nil, err
+	}
+	return newReader(r), newWriter(w), nil
+}
+
+func (h *Negotiator) recv(r io.Reader) error {
+	var buf [8]byte
+	if _, err := io.ReadFull(r, buf[0:8]); err != nil {
+		return err
+	}
+	if !bytes.Equal(buf[0:4], []byte{0x00, 'S', 'P', 0x00}) {
+		return errors.New("zenio: invalid header")
+	}
+	_ = buf[4:6] // TODO what should we do with endpoint?
+	if !bytes.Equal(buf[6:8], []byte{0x00, 0x00}) {
+		return errors.New("zenio: non-zero reserved bytes found")
+	}
+	return nil
+}
+
+func (h *Negotiator) send(w io.Writer) error {
+	// TODO investigate endpoint data
+	var buf = [8]byte{
+		1: 'S',
+		2: 'P',
+		3: 0x00, // TODO rfc says 0x01?
+		5: 0x10,
+	}
+	if n, err := w.Write(buf[:]); err != nil {
+		return err
+	} else if n != 8 {
+		return errors.New("zenio: failed to write sp header")
+	}
+	return nil
+}
+
+// TODO come up with a better name (FrameReader, Decoder?)
+// reader reads the wire format used for Scalable Protocols.
+type reader struct {
+	rd     io.Reader
+	buf    [8]byte
+	broken bool
+}
+
+func newReader(rd io.Reader) *reader {
+	return &reader{rd: rd}
+}
+
+// length reads and returns the length of the payload which is expected to be
+// received.
+func (r *reader) length() (int, error) {
+	if _, err := io.ReadFull(r.rd, r.buf[:]); err != nil {
+		return 0, err
+	}
+	length := binary.BigEndian.Uint64(r.buf[:])
+	if length > uint64(maxInt) {
+		return 0, syscall.EFBIG
+	}
+	return int(length), nil
+}
+
+// Read reads the payload data into p.
+func (r *reader) Read() (protocol.Message, error) {
+	length, err := r.length()
+	if err != nil {
+		r.broken = true
+		return nil, err
+	}
+	lr := &io.LimitedReader{r.rd, int64(length)}
+	return &singleFrame{lr: lr}, err
+}
+
+// A writer writes the wire format used for Scalable Protocols.
+type writer struct {
+	wr     io.Writer
+	buf    [8]byte
+	broken bool
+}
+
+func newWriter(wr io.Writer) *writer {
+	return &writer{wr: wr}
+}
+
+// Write writes the payload.
+func (w *writer) Write(src protocol.Message) error {
+	frame, err := src.Next()
+	if err != nil {
+		return err
+	}
+	if src.More() {
+		panic("Unsupported multiple frames")
+	}
+
+	binary.BigEndian.PutUint64(w.buf[:], uint64(frame.Len()))
+	if written, err := w.wr.Write(w.buf[:]); err != nil {
+		w.broken = true
+		return err
+	} else if written != 8 {
+		w.broken = true
+		return errors.New("zenio: failed to write frame size")
+	}
+
+	if _, err := io.Copy(w.wr, frame); err != nil {
+		w.broken = true
+		return err
+	}
+	return nil
+}
+
+// singleFrame implements the protocol.Frame for Scalable Protocols, where
+// there is no such thing as message framing.
 type singleFrame struct {
 	lr   *io.LimitedReader
 	read bool
@@ -54,154 +180,4 @@ func (sf *singleFrame) Next() (protocol.Frame, error) {
 	}
 	sf.read = true
 	return sf, nil
-}
-
-// TODO come up with a better name (FrameReader, Decoder?)
-// A Reader reads the wire format used for Scalable Protocols. First Read
-// will also parse the header.
-type Reader struct {
-	rd  io.Reader
-	buf [8]byte
-
-	setupDone bool
-	broken    bool
-}
-
-// NewReader returns a new Reader.
-func NewReader(rd io.Reader) *Reader {
-	return &Reader{rd: rd}
-}
-
-// TODO split up to support symmetrical handshake. Rename.
-func (r *Reader) Init() error {
-	err := r.setup()
-	if err != nil {
-		r.broken = true
-	}
-	return err
-}
-
-func (r *Reader) setup() error {
-	if r.setupDone {
-		return nil
-	} else if r.broken {
-		return errors.New("zenio: can't read from broken reader")
-	}
-
-	if _, err := io.ReadFull(r.rd, r.buf[0:8]); err != nil {
-		return err
-	}
-	if !bytes.Equal(r.buf[0:4], []byte{0x00, 'S', 'P', 0x00}) {
-		return errors.New("zenio: invalid header")
-	}
-	_ = r.buf[4:6] // TODO what should we do with endpoint?
-	if !bytes.Equal(r.buf[6:8], []byte{0x00, 0x00}) {
-		return errors.New("zenio: non-zero reserved bytes found")
-	}
-	r.setupDone = true
-
-	return nil
-}
-
-// length reads and returns the length of the payload which is expected to be
-// received.
-func (r *Reader) length() (int, error) {
-	if err := r.setup(); err != nil {
-		return 0, err
-	}
-
-	if _, err := io.ReadFull(r.rd, r.buf[:]); err != nil {
-		return 0, err
-	}
-	length := binary.BigEndian.Uint64(r.buf[:])
-	if length > uint64(maxInt) {
-		return 0, syscall.EFBIG
-	}
-	return int(length), nil
-}
-
-// Read reads the payload data into p.
-func (r *Reader) Read() (protocol.Message, error) {
-	length, err := r.length()
-	if err != nil {
-		r.broken = true
-		return nil, err
-	}
-	lr := &io.LimitedReader{r.rd, int64(length)}
-	return &singleFrame{lr: lr}, err
-}
-
-// A Writer writes the wire format used for Scalable Protocols. First Write
-// will initiate the format by writing header data.
-type Writer struct {
-	wr  io.Writer
-	buf [8]byte
-
-	setupDone bool
-	broken    bool
-}
-
-// NewWriter returns a new Writer.
-func NewWriter(wr io.Writer) *Writer {
-	return &Writer{wr: wr}
-}
-
-func (w *Writer) Init() error {
-	err := w.setup()
-	if err != nil {
-		w.broken = true
-	}
-	return err
-}
-
-func (w *Writer) setup() error {
-	if w.setupDone {
-		return nil
-	} else if w.broken {
-		return errors.New("zenio: can't write to broken writer")
-	}
-	// TODO investigate endpoint data
-	var buf = [8]byte{
-		1: 'S',
-		2: 'P',
-		3: 0x00, // TODO rfc says 0x01?
-		5: 0x10,
-	}
-	if n, err := w.wr.Write(buf[:]); err != nil {
-		return err
-	} else if n != 8 {
-		return errors.New("zenio: failed to write sp header")
-	}
-	w.setupDone = true
-
-	return nil
-}
-
-// Write writes the payload.
-func (w *Writer) Write(src protocol.Message) error {
-	frame, err := src.Next()
-	if err != nil {
-		return err
-	}
-	if src.More() {
-		panic("Unsupported multiple frames")
-	} else if err := w.setup(); err != nil {
-		w.broken = true
-		return err
-	}
-
-	binary.BigEndian.PutUint64(w.buf[:], uint64(frame.Len()))
-	if written, err := w.wr.Write(w.buf[:]); err != nil {
-		w.broken = true
-		return err
-	} else if written != 8 {
-		w.broken = true
-		return errors.New("zenio: failed to write frame size")
-	}
-
-	if _, err := io.Copy(w.wr, frame); err != nil {
-		w.broken = true
-		return err
-	}
-	return nil
 }

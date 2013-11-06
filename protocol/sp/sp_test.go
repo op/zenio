@@ -9,6 +9,20 @@ import (
 	"github.com/op/zenio/protocol"
 )
 
+func TestNegotiator(t *testing.T) {
+	// TODO improve test
+	var n Negotiator
+	var buf bytes.Buffer
+	var header = []byte{0x00, 0x53, 0x50, 0x00, 0x00, 0x10, 0x00, 0x00}
+	_, _, err := n.Upgrade(bytes.NewReader(header), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.Bytes(), header) {
+		t.Errorf("%#v != %#v", buf.Bytes(), header)
+	}
+}
+
 var testCases = []struct {
 	err     error
 	encoded []byte
@@ -17,7 +31,6 @@ var testCases = []struct {
 	{
 		err: nil,
 		encoded: []byte{
-			0x00, 0x53, 0x50, 0x00, 0x00, 0x10, 0x00, 0x00, // header
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // length
 		},
 		decoded: [][]byte{
@@ -26,7 +39,6 @@ var testCases = []struct {
 	}, {
 		err: nil,
 		encoded: []byte{
-			0x00, 0x53, 0x50, 0x00, 0x00, 0x10, 0x00, 0x00, // header
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // length
 			'h', 'e', 'l', 'l', 'o',
 		},
@@ -36,7 +48,6 @@ var testCases = []struct {
 	}, {
 		err: nil,
 		encoded: []byte{
-			0x00, 0x53, 0x50, 0x00, 0x00, 0x10, 0x00, 0x00, // header
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // length
 			'p', '1',
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // length
@@ -84,7 +95,7 @@ func TestReader(t *testing.T) {
 		frame protocol.Frame
 	)
 	for _, c := range testCases {
-		r := NewReader(bytes.NewReader(c.encoded))
+		r := newReader(bytes.NewReader(c.encoded))
 		for _, p := range c.decoded {
 			var buf bytes.Buffer
 			msg, err = r.Read()
@@ -122,7 +133,7 @@ func TestWriter(t *testing.T) {
 			buf bytes.Buffer
 			err error
 		)
-		w := NewWriter(&buf)
+		w := newWriter(&buf)
 		for _, p := range c.decoded {
 			msg := newByteMessage(p)
 			if err = w.Write(msg); err != nil {
@@ -146,8 +157,7 @@ func benchmarkReader(b *testing.B, size int64) {
 	binary.BigEndian.PutUint64(sp[:], uint64(size))
 	spr := bytes.NewReader(sp)
 
-	r := NewReader(spr)
-	r.setupDone = true
+	r := newReader(spr)
 
 	var buf bytes.Buffer
 	buf.Grow(int(size))
@@ -186,8 +196,7 @@ func benchmarkWriter(b *testing.B, size int64) {
 	b.SetBytes(size)
 
 	var buf bytes.Buffer
-	w := NewWriter(&buf)
-	w.setupDone = true
+	w := newWriter(&buf)
 	p := make([]byte, size)
 	buf.Grow(int(size) * 2)
 
