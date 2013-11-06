@@ -15,11 +15,13 @@
 package zenio
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/hex"
 	"io"
 	"math/rand"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -85,6 +87,8 @@ type hexDumper struct {
 
 	// Prefix is something optional written before the dump.
 	Prefix string
+
+	mu sync.Mutex
 }
 
 func (hd *hexDumper) Flush() error {
@@ -96,10 +100,25 @@ func (hd *hexDumper) Flush() error {
 
 	// Dump the hex dump with the optional prefix.
 	if hd.Len() > 0 {
-		writer.Write([]byte(hd.Prefix))
-		dumper := hex.Dumper(writer)
-		defer dumper.Close()
+		buf := &bytes.Buffer{}
+		dumper := hex.Dumper(buf)
 		hd.WriteTo(dumper)
+		dumper.Close()
+		hd.Reset()
+
+		hd.mu.Lock()
+		defer hd.mu.Unlock()
+
+		scanner := bufio.NewScanner(buf)
+		for scanner.Scan() {
+			if _, err := writer.Write([]byte(hd.Prefix)); err != nil {
+				return err
+			} else if _, err := writer.Write(scanner.Bytes()); err != nil {
+				return err
+			} else if _, err := writer.Write([]byte("\n")); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
