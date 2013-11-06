@@ -33,6 +33,11 @@ import (
 // TODO add options for specific socket types. eg keep-alives for tcp etc.
 // TODO implement inproc using net.Pipe()? channels?
 
+var (
+	DefaultSP   = &sp.Negotiator{}
+	DefaultZMTP = &zmtp.Negotiator{}
+)
+
 type Identity []byte
 
 type msgErrCh struct {
@@ -86,9 +91,9 @@ func (s *socket) init(network string, address string) error {
 
 	switch s.protocol {
 	case "sp":
-		s.neg = &sp.Negotiator{}
+		s.neg = DefaultSP
 	case "zmtp":
-		s.neg = &zmtp.Negotiator{Identity: s.ident}
+		s.neg = DefaultZMTP
 	default:
 		panic("unhandled protocol: " + s.protocol)
 	}
